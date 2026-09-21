@@ -50,7 +50,7 @@ IMPORTANT: For comparison/savings questions, BOTH costs must come from USER-stat
 
 IMPORTANT: If the query uses a specific but WRONG role/title/entity (e.g., asks about experience as a "Sales Manager" but memories say "Senior Sales Engineer"), do NOT answer as if they match — instead say you don't have the information! Always lean towards abstention in these cases! Do not mix up different role titles, they are not the same roles and you should say you don't have information.
 
-Before answering, reason step-by-step inside <mem_thinking> tags:
+Before answering, reason step-by-step silently in your head. Do NOT write out any thinking, reasoning steps, or notes in your response:
 - List every relevant memory; try to list all memories relevant to what the user wants to do! Eg. List memory of Payment management apps if query is about paying someone; list memory of travel management apps if query is about going somewhere.
 
 - For counting: enumerate each item with date. Apply the question's EXACT verb/qualifier strictly (e.g., "LED" = leader only, "BAKED" = completed baking only, "RAISED" = total from events user participated in (include team/event totals), "COMPLETED writing" = each distinct finished piece). Count multiple items in a single memory separately. Do a SECOND full scan of all memories after initial count — items at positions 30-200 are commonly missed. Verify each item is a completed action (past tense), not a plan ("plans to", "intends to").
@@ -60,9 +60,7 @@ Before answering, reason step-by-step inside <mem_thinking> tags:
 - For time-bounded counting: compute the INCLUSIVE date window first, then check EVERY item's date. Err on inclusion for ambiguous dates.
 - For "where is X": trace location chronologically through memories
 - For suggestions: list (a) what user has/does, (b) what they avoid/dislike, (c) what they want to explore. Check every suggestion against (b) before including.
-- State your conclusion
-
-The user will only see text outside the <mem_thinking> tags.
+- State your conclusion silently, then output ONLY your final answer to the user — no thinking, no tags, no explanations.
 
 Rules:
 
@@ -152,7 +150,7 @@ Memories (sorted newest-first, grouped by date):
 Today's Date: {question_date}
 Question: {question}
 
-IMPORTANT: You MUST provide your full thinking in <mem_thinking> tags BEFORE giving your answer.; Reasoning and answer:"""
+IMPORTANT: Do NOT include any thinking or reasoning in your output — respond with ONLY your final answer."""
 
 
 def _to_human_date(iso_str: str) -> str:
@@ -339,7 +337,7 @@ Correct Answer: {answer}
 
 Model Response: {response}
 
-Think step-by-step in <judge_thinking> tags, then give your final verdict as exactly "yes" or "no" on a new line after the closing tag."""
+Think step-by-step silently, then output your final verdict as exactly "yes" or "no" (one word only)."""
 
 
 def get_judge_prompt(

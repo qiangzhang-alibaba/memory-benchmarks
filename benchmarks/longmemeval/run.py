@@ -53,7 +53,7 @@ from tqdm import tqdm
 
 from benchmarks.common.llm_client import LLMClient
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
-from benchmarks.common.metrics import compute_overall_metrics
+from benchmarks.common.metrics import compute_latency_summary, compute_overall_metrics
 from benchmarks.common.schema import (
     CutoffResult,
     EvalItem,
@@ -535,6 +535,8 @@ async def process_question_answerer(
         parse_longmemeval_date_human(question_date) if question_date else ""
     )
 
+    total_start = time.monotonic()
+
     # --- Search ---
     if existing_search_results is not None:
         formatted = existing_search_results
@@ -570,11 +572,13 @@ async def process_question_answerer(
         result["user_profile"] = user_profile
 
     if predict_only:
+        result["total_latency_ms"] = round((time.monotonic() - total_start) * 1000, 1)
         return result
 
     # --- Answer + Judge at each cutoff ---
     cutoff_results: dict[str, dict] = {}
 
+    judge_time_ms = 0.0
     for c in cutoffs:
         sliced = formatted[:c]
 
@@ -611,7 +615,9 @@ async def process_question_answerer(
             response=generated_answer,
             question_date=question_date_human,
         )
+        judge_start = time.monotonic()
         correct, judge_raw = await judge_llm.judge_yes_no(judge_prompt)
+        judge_time_ms += (time.monotonic() - judge_start) * 1000
         score = 1.0 if correct else 0.0
         judgment = "PASS" if correct else "FAIL"
 
@@ -625,6 +631,11 @@ async def process_question_answerer(
         }
 
     result["cutoff_results"] = cutoff_results
+    # Total time = search + answer generation (excludes judge, per official
+    # "time to generate the complete response" semantics). Judge time is
+    # recorded separately for reference only.
+    result["total_latency_ms"] = round((time.monotonic() - total_start) * 1000 - judge_time_ms, 1)
+    result["judge_latency_ms"] = round(judge_time_ms, 1)
     return result
 
 
@@ -649,6 +660,8 @@ async def process_question_retrieval(
     question_type = question["question_type"]
     answer = str(question["answer"])
     question_date = question.get("question_date", "")
+
+    total_start = time.monotonic()
 
     # --- Search ---
     start = time.monotonic()
@@ -681,11 +694,13 @@ async def process_question_retrieval(
         result["user_profile"] = user_profile
 
     if predict_only:
+        result["total_latency_ms"] = round((time.monotonic() - total_start) * 1000, 1)
         return result
 
     # --- Judge at each cutoff ---
     cutoff_results: dict[str, dict] = {}
 
+    judge_time_ms = 0.0
     for c in cutoffs:
         sliced = formatted[:c]
         label = cutoff_label(c)
@@ -697,10 +712,12 @@ async def process_question_retrieval(
             question_date=question_date,
             user_profile=user_profile,
         )
+        judge_start = time.monotonic()
         raw = await judge_llm.generate_structured(
             system=RETRIEVAL_JUDGE_SYSTEM,
             user=prompt,
         )
+        judge_time_ms += (time.monotonic() - judge_start) * 1000
 
         if isinstance(raw, dict):
             judgment_str = raw.get("judgment", "").upper()
@@ -722,6 +739,10 @@ async def process_question_retrieval(
         }
 
     result["cutoff_results"] = cutoff_results
+    # Total time = search only in retrieval mode (no answer generation).
+    # Judge time is recorded separately for reference only.
+    result["total_latency_ms"] = round((time.monotonic() - total_start) * 1000 - judge_time_ms, 1)
+    result["judge_latency_ms"] = round(judge_time_ms, 1)
     return result
 
 
@@ -989,8 +1010,8 @@ def parse_args() -> argparse.Namespace:
         help="With --evaluate-only: re-run judge even if cutoff_results exist",
     )
     parser.add_argument(
-        "--resume", action="store_true", default=True,
-        help="Resume from checkpoint (default: True)",
+        "--resume", action=argparse.BooleanOptionalAction, default=True,
+        help="Resume from checkpoint (default: True; pass --no-resume to force a fresh run)",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -1033,8 +1054,10 @@ def parse_args() -> argparse.Namespace:
         help="Requests per minute for LLM",
     )
     parser.add_argument(
-        "--backend", default="oss", choices=["oss", "cloud"],
-        help="Mem0 backend: 'oss' for self-hosted server (default), 'cloud' for api.mem0.ai",
+        "--backend", default="oss", choices=["oss", "cloud", "mem0", "polarmem"],
+        help="Mem0 backend: 'oss' for self-hosted server (default), 'cloud' for api.mem0.ai, "
+             "'mem0' for a Mem0-compatible server using the original /memories + /search "
+             "endpoints, 'polarmem' for a Mem0-compatible v1/v2 API (e.g. Polar Mem)",
     )
     parser.add_argument(
         "--mem0-host", default=None,
@@ -1042,7 +1065,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mem0-api-key", default=None,
-        help="Mem0 API key (cloud mode only)",
+        help="Mem0 API key (cloud/polarmem mode only)",
     )
     return parser.parse_args()
 
@@ -1050,6 +1073,21 @@ def parse_args() -> argparse.Namespace:
 # ===============================================================================
 # MAIN
 # ===============================================================================
+
+
+def _llm_thinking_kwargs(model: str) -> dict[str, Any]:
+    """Toggle thinking mode for DashScope qwen3 series models via .env.
+
+    Controlled by QWEN3_ENABLE_THINKING in .env (default: disabled, since
+    benchmark answer/judge generation only needs the plain response and
+    thinking adds long reasoning latency). Set it to "true"/"1" to enable.
+    Non-qwen3 models are unaffected.
+    """
+    if not model.lower().startswith("qwen3"):
+        return {}
+    raw = os.getenv("QWEN3_ENABLE_THINKING", "false").strip().lower()
+    enable = raw in ("1", "true", "yes", "on")
+    return {"enable_thinking": enable}
 
 
 async def async_main() -> None:
@@ -1114,10 +1152,12 @@ async def async_main() -> None:
 
     answerer = LLMClient(
         model=args.answerer_model, provider=args.provider, rpm=args.rpm,
+        **_llm_thinking_kwargs(args.answerer_model),
     )
     judge_provider = args.judge_provider or args.provider
     judge_llm = LLMClient(
         model=args.judge_model, provider=judge_provider, rpm=args.rpm,
+        **_llm_thinking_kwargs(args.judge_model),
     )
 
     if args.evaluate_only:
@@ -1234,13 +1274,16 @@ async def async_main() -> None:
     mem0 = Mem0Client(
         mode=backend,
         host=args.mem0_host,
-        api_key=args.mem0_api_key if backend == "cloud" else None,
+        api_key=args.mem0_api_key if backend in ("cloud", "mem0", "polarmem") else None,
         rpm=args.rpm,
     )
     shutdown = GracefulShutdown()
     checkpoint = Checkpoint(output_dir)
 
     all_evaluations: list[dict] = []
+    search_latencies_ms: list[float] = []
+    total_latencies_ms: list[float] = []
+    judge_latencies_ms: list[float] = []
 
     if args.resume:
         for p in sorted(Path(output_dir).glob("*.json")):
@@ -1250,6 +1293,15 @@ async def async_main() -> None:
                 data = json.loads(p.read_text())
                 if data.get("question_type"):
                     all_evaluations.append(data)
+                    sl = data.get("retrieval", {}).get("search_latency_ms", 0) or 0
+                    tl = data.get("total_latency_ms", 0) or 0
+                    jl = data.get("judge_latency_ms", 0) or 0
+                    if sl > 0:
+                        search_latencies_ms.append(sl)
+                    if tl > 0:
+                        total_latencies_ms.append(tl)
+                    if jl > 0:
+                        judge_latencies_ms.append(jl)
             except (json.JSONDecodeError, KeyError):
                 continue
         print(f"  Loaded {len(all_evaluations)} existing results")
@@ -1355,6 +1407,15 @@ async def async_main() -> None:
                     async with results_lock:
                         all_evaluations.append(result)
                         existing_ids.add(question_id)
+                        sl = result.get("retrieval", {}).get("search_latency_ms", 0) or 0
+                        tl = result.get("total_latency_ms", 0) or 0
+                        jl = result.get("judge_latency_ms", 0) or 0
+                        if sl > 0:
+                            search_latencies_ms.append(sl)
+                        if tl > 0:
+                            total_latencies_ms.append(tl)
+                        if jl > 0:
+                            judge_latencies_ms.append(jl)
                     pbar.update(1)
 
             tasks = [process_single_question(q) for q in questions_to_process]
@@ -1373,6 +1434,22 @@ async def async_main() -> None:
         if has_cutoffs:
             metrics = compute_longmemeval_metrics(deduped, cutoffs)
             display_results(metrics, cutoffs)
+
+            # Latency measurements: p50 (median) and p95 (95th percentile) in
+            # seconds for search time (fetching memories) and total time
+            # (search + answer generation; judge excluded per official
+            # "time to generate the complete response" semantics). Judge time
+            # is reported separately for reference only.
+            latency = {
+                "search": compute_latency_summary([v / 1000 for v in search_latencies_ms]),
+                "total": compute_latency_summary([v / 1000 for v in total_latencies_ms]),
+                "judge": compute_latency_summary([v / 1000 for v in judge_latencies_ms]),
+            }
+            s, t, j = latency["search"], latency["total"], latency["judge"]
+            print(f"\nLatency measurements (p50 median / p95 95th percentile, in seconds):")
+            print(f"  Search time: p50={s['p50_s']:.3f}s, p95={s['p95_s']:.3f}s ({s['count']} queries)")
+            print(f"  Total time (search + answer):  p50={t['p50_s']:.3f}s, p95={t['p95_s']:.3f}s ({t['count']} questions)")
+            print(f"  Judge time (reference only):   p50={j['p50_s']:.3f}s, p95={j['p95_s']:.3f}s ({j['count']} questions)")
 
             # Save unified result
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1398,6 +1475,7 @@ async def async_main() -> None:
                     "seed": args.seed,
                 },
                 "metrics_by_cutoff": metrics,
+                "latency": latency,
                 "evaluations": all_evaluations,
             })
             print(f"\nResults saved to: {unified_path}")

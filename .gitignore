@@ -22,7 +22,7 @@ logs/
 evaluation_results/
 
 # Environment
-.env
+#.env
 .env.local
 .env.*.local
 

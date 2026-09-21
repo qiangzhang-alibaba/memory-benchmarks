@@ -52,6 +52,7 @@ class LLMClient:
         max_retries: int = 5,
         rpm: int = 200,
         timeout: float = 120.0,
+        enable_thinking: bool | None = None,
         **kwargs: Any,
     ):
         self.model = model
@@ -59,6 +60,9 @@ class LLMClient:
         self.max_retries = max_retries
         self.limiter = AsyncLimiter(rpm, 60)
         self.timeout = timeout
+        # None = leave model default; True/False = force thinking mode on/off
+        # (forwarded via extra_body chat_template_kwargs for DashScope qwen3)
+        self.enable_thinking = enable_thinking
         self._client: Any = None
 
         if self.provider == "anthropic":
@@ -81,6 +85,14 @@ class LLMClient:
         if m.startswith(("gpt-5", "o1", "o3", "o4")):
             return {}
         return {"temperature": temperature}
+
+    def _openai_chat_thinking_kwargs(self) -> dict[str, Any]:
+        """OpenAI-compatible: forward enable_thinking via extra_body (DashScope qwen3)."""
+        if self.enable_thinking is None:
+            return {}
+        # DashScope OpenAI-compatible mode accepts extra_body with
+        # chat_template_kwargs.enable_thinking to toggle qwen3 thinking mode.
+        return {"extra_body": {"chat_template_kwargs": {"enable_thinking": self.enable_thinking}}}
 
     def _parse_yes_no_judgment(self, raw: str) -> bool:
         """Extract the final yes/no verdict from judge output."""
@@ -170,6 +182,7 @@ class LLMClient:
                             messages=messages,
                             **self._openai_chat_temperature_kwargs(temperature),
                             **self._openai_chat_token_limit_kwargs(max_tokens),
+                            **self._openai_chat_thinking_kwargs(),
                         ),
                         timeout=self.timeout,
                     )
@@ -272,6 +285,7 @@ class LLMClient:
                             **self._openai_chat_temperature_kwargs(temperature),
                             response_format={"type": "json_object"},
                             **self._openai_chat_token_limit_kwargs(max_tokens),
+                            **self._openai_chat_thinking_kwargs(),
                         ),
                         timeout=self.timeout,
                     )

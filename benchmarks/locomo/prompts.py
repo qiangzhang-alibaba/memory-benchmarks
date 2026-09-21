@@ -37,7 +37,7 @@ CATEGORIES_TO_EVALUATE = [1, 2, 3, 4]
 # ANSWER GENERATION PROMPT
 # ===============================================================================
 
-ANSWER_GENERATION_PROMPT = """You are answering a question using retrieved memories from past conversations. Follow these reasoning steps IN ORDER.
+ANSWER_GENERATION_PROMPT = """You are answering a question using retrieved memories from past conversations. Follow these reasoning steps IN ORDER, but do ALL reasoning silently in your head — do NOT write out any reasoning, steps, or intermediate notes in your response.
 
 ## Step 1: SCAN ALL MEMORIES
 Read EVERY memory below from first to last. For each one that contains information relevant to the question, note it. Do NOT stop after finding the first relevant memory — important details are often scattered across many memories, including ones far down the list. Give equal weight to ALL memories regardless of position — a memory near the end is just as likely to contain the answer as one near the beginning. In these memories, "User" refers to the main person whose memories these are.
@@ -94,7 +94,7 @@ Give a direct, specific answer. NEVER say "not specified", "not mentioned", "no 
 
 Question: {question}
 
-Work through Steps 1-7, then give your final answer after "ANSWER:".
+Work through Steps 1-7 silently in your head. Your ENTIRE response must be ONLY the final answer on a single line starting with "ANSWER:". Do not include any reasoning, step titles, or explanations.
 """
 
 

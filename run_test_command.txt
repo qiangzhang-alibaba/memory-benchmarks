@@ -1,0 +1,42 @@
+cd /home/jingrui.zq/polardb-test/jingrui.zq/mem0_dir/memory-benchmarks
+
+# 只测第 0 个对话（10 个对话中任选），该对话只抽 5 题（默认全部 21 题）
+/usr/local/python3.11/bin/python3.11 -m benchmarks.locomo.run \
+  --project-name polar_locomo_test \
+  --conversations 0 \
+  --max-questions 5 \
+  --answerer-model qwen3.6-plus --judge-model qwen3.6-plus \
+  --dataset-path datasets/locomo/repo/data/locomo10.json --max-workers 10 --rerank
+
+qwen-flash（或 qwen3.5-4b / qwen3.5-9b）
+
+# LOCOMO 完整（10 个对话，约 300 问题；摄入约需 3 小时，可分批）
+/usr/local/python3.11/bin/python3.11 -m benchmarks.locomo.run \
+  --project-name polar_locomo_full \
+  --answerer-model qwen3.6-plus --judge-model qwen3.6-plus \
+  --dataset-path datasets/locomo/repo/data/locomo10.json --max-workers 2 --rerank
+
+nohup python -m benchmarks.locomo.run \
+  --project-name polar_locomo_full \
+  --answerer-model qwen3.6-plus --judge-model qwen3.6-plus \
+  --dataset-path datasets/locomo/repo/data/locomo10.json --max-workers 10 --rerank
+
+# LongMemEval 快速测试（每题型 2 题，共 12 题，约 20-30 分钟）
+/usr/local/python3.11/bin/python3.11 -m benchmarks.longmemeval.run \
+  --project-name polar_lme_test \
+  --per-type 2 \
+  --answerer-model qwen3.6-plus --judge-model qwen3.6-plus \
+  --dataset-path datasets/longmemeval/longmemeval_s_cleaned.json --max-workers 10
+
+# LongMemEval 完整（500 题，耗时数小时；支持 --resume 断点续传，默认开启）
+/usr/local/python3.11/bin/python3.11 -m benchmarks.longmemeval.run \
+  --project-name polar_lme_full \
+  --all-questions \
+  --answerer-model qwen3.6-plus --judge-model qwen3.6-plus \
+  --dataset-path datasets/longmemeval/longmemeval_s_cleaned.json --max-workers 10
+
+nohup python -m benchmarks.longmemeval.run \
+  --project-name polar_lme_full \
+  --all-questions \
+  --answerer-model qwen3.6-plus --judge-model qwen3.6-plus \
+  --dataset-path datasets/longmemeval/longmemeval_s_cleaned.json --max-workers 10

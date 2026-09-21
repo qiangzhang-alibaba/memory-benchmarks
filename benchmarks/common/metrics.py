@@ -143,6 +143,44 @@ def compute_overall_metrics(
     return metrics
 
 
+def compute_latency_summary(latency_seconds: list[float]) -> dict[str, Any]:
+    """Compute latency summary statistics (all values in seconds).
+
+    Args:
+        latency_seconds: List of latency measurements in seconds.
+
+    Returns:
+        Dict with count, avg_s, min_s, p50_s, p95_s, max_s.
+    """
+    if not latency_seconds:
+        return {
+            "count": 0,
+            "avg_s": 0.0,
+            "min_s": 0.0,
+            "p50_s": 0.0,
+            "p95_s": 0.0,
+            "max_s": 0.0,
+        }
+
+    vals = sorted(latency_seconds)
+
+    def pct(p: float) -> float:
+        # Linear interpolation between closest ranks (numpy-style)
+        k = (len(vals) - 1) * p
+        lo = int(k)
+        hi = min(lo + 1, len(vals) - 1)
+        return vals[lo] + (vals[hi] - vals[lo]) * (k - lo)
+
+    return {
+        "count": len(vals),
+        "avg_s": round(statistics.mean(vals), 3),
+        "min_s": round(vals[0], 3),
+        "p50_s": round(pct(0.50), 3),
+        "p95_s": round(pct(0.95), 3),
+        "max_s": round(vals[-1], 3),
+    }
+
+
 def compute_kendall_tau_b(predicted_order: list[int], reference_order: list[int]) -> float:
     """Compute Kendall tau-b rank correlation coefficient.
 

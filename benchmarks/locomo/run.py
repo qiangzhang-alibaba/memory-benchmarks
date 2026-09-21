@@ -44,7 +44,7 @@ from tqdm import tqdm
 
 from benchmarks.common.llm_client import LLMClient
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
-from benchmarks.common.metrics import compute_overall_metrics
+from benchmarks.common.metrics import compute_latency_summary, compute_overall_metrics
 from benchmarks.common.schema import (
     CutoffResult,
     EvalItem,
@@ -412,6 +412,8 @@ async def process_question(
     category = qa["category"]
     answer = str(qa["answer"])
 
+    total_start = time.monotonic()
+
     # --- Search ---
     start = time.monotonic()
     search_results = await mem0.search(question, user_id, top_k=top_k, score_debug=score_debug)
@@ -442,6 +444,7 @@ async def process_question(
         result["user_profile"] = user_profile
 
     if predict_only:
+        result["total_latency_ms"] = round((time.monotonic() - total_start) * 1000, 1)
         return result
 
     # --- Answer + Judge at each cutoff ---
@@ -457,6 +460,7 @@ async def process_question(
                 ev_ctx += evidence_lookup[key] + "\n"
         ev_ctx = ev_ctx.strip()
 
+    judge_time_ms = 0.0
     for c in cutoffs:
         sliced = formatted[:c]
         label = cutoff_label(c)
@@ -473,10 +477,12 @@ async def process_question(
         else:
             judge_prompt = get_judge_prompt(category, question, processed_answer, generated_answer)
 
+        judge_start = time.monotonic()
         raw = await judge_llm.generate_structured(
             system=JUDGE_SYSTEM_PROMPT,
             user=judge_prompt,
         )
+        judge_time_ms += (time.monotonic() - judge_start) * 1000
         if isinstance(raw, dict):
             label_val = raw.get("label", "").upper()
             correct = label_val == "CORRECT"
@@ -495,6 +501,11 @@ async def process_question(
         }
 
     result["cutoff_results"] = cutoff_results
+    # Total time = search + answer generation (excludes judge, per official
+    # "time to generate the complete response" semantics). Judge time is
+    # recorded separately for reference only.
+    result["total_latency_ms"] = round((time.monotonic() - total_start) * 1000 - judge_time_ms, 1)
+    result["judge_latency_ms"] = round(judge_time_ms, 1)
     return result
 
 
@@ -679,8 +690,10 @@ def parse_args() -> argparse.Namespace:
         description="Run LOCOMO-10 benchmark: ingest + search + answer + judge",
     )
     parser.add_argument("--project-name", required=True, help="Name for this eval run")
-    parser.add_argument("--answerer-model", default="gpt-5", help="Model for answer generation")
-    parser.add_argument("--judge-model", default="gpt-5", help="Model for judging")
+    parser.add_argument("--answerer-model", default=None,
+                        help="Model for answer generation (default: $ANSWERER_MODEL from .env, else gpt-5)")
+    parser.add_argument("--judge-model", default=None,
+                        help="Model for judging (default: $JUDGE_MODEL from .env, else gpt-5)")
     parser.add_argument("--provider", default="openai", help="LLM provider (openai, anthropic, azure)")
     parser.add_argument("--judge-provider", default=None, help="Judge provider (defaults to --provider)")
     parser.add_argument("--conversations", default="0,1,2,3,4,5,6,7,8,9", help="Comma-separated conversation indices")
@@ -709,18 +722,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user-profile", action="store_true", help="Fetch user profiles")
     parser.add_argument("--max-questions", type=int, default=None, help="Max questions to process (for quick testing)")
     parser.add_argument("--rpm", type=int, default=200, help="Requests per minute for LLM")
-    parser.add_argument("--backend", default="oss", choices=["oss", "cloud"],
-                        help="Mem0 backend: 'oss' for self-hosted server (default), 'cloud' for api.mem0.ai")
+    parser.add_argument("--backend", default="oss", choices=["oss", "cloud", "mem0", "polarmem"],
+                        help="Mem0 backend: 'oss' for self-hosted server (default), 'cloud' for api.mem0.ai, "
+                             "'mem0' for a Mem0-compatible server using the original /memories + /search "
+                             "endpoints, 'polarmem' for a Mem0-compatible v1/v2 API (e.g. Polar Mem)")
     parser.add_argument("--mem0-host", default=None,
                         help="Mem0 server URL (default: http://localhost:8888 for oss, https://api.mem0.ai for cloud)")
     parser.add_argument("--mem0-api-key", default=None,
-                        help="Mem0 API key (cloud mode only)")
-    return parser.parse_args()
+                        help="Mem0 API key (cloud/polarmem mode only)")
+    args = parser.parse_args()
+    # CLI args take precedence; fall back to .env, then built-in defaults
+    args.answerer_model = args.answerer_model or os.getenv("ANSWERER_MODEL") or "gpt-5"
+    args.judge_model = args.judge_model or os.getenv("JUDGE_MODEL") or "gpt-5"
+    return args
 
 
 # ===============================================================================
 # MAIN
 # ===============================================================================
+
+
+def _llm_thinking_kwargs(model: str) -> dict[str, Any]:
+    """Toggle thinking mode for DashScope qwen3 series models via .env.
+
+    Controlled by QWEN3_ENABLE_THINKING in .env (default: disabled, since
+    benchmark answer/judge generation only needs the plain response and
+    thinking adds long reasoning latency). Set it to "true"/"1" to enable.
+    Non-qwen3 models are unaffected.
+    """
+    if not model.lower().startswith("qwen3"):
+        return {}
+    raw = os.getenv("QWEN3_ENABLE_THINKING", "false").strip().lower()
+    enable = raw in ("1", "true", "yes", "on")
+    return {"enable_thinking": enable}
 
 
 async def async_main() -> None:
@@ -754,9 +788,15 @@ async def async_main() -> None:
         evidence_lookup = load_evidence_lookup(dataset_path)
         print(f"  Evidence lookup: {len(evidence_lookup)} entries")
 
-    answerer = LLMClient(model=args.answerer_model, provider=args.provider, rpm=args.rpm)
+    answerer = LLMClient(
+        model=args.answerer_model, provider=args.provider, rpm=args.rpm,
+        **_llm_thinking_kwargs(args.answerer_model),
+    )
     judge_provider = args.judge_provider or args.provider
-    judge_llm = LLMClient(model=args.judge_model, provider=judge_provider, rpm=args.rpm)
+    judge_llm = LLMClient(
+        model=args.judge_model, provider=judge_provider, rpm=args.rpm,
+        **_llm_thinking_kwargs(args.judge_model),
+    )
 
     if args.evaluate_only:
         expected_items = expected_locomo_question_items(
@@ -832,13 +872,16 @@ async def async_main() -> None:
     mem0 = Mem0Client(
         mode=backend,
         host=args.mem0_host,
-        api_key=args.mem0_api_key if backend == "cloud" else None,
+        api_key=args.mem0_api_key if backend in ("cloud", "mem0", "polarmem") else None,
         rpm=args.rpm,
     )
     shutdown = GracefulShutdown()
     checkpoint = Checkpoint(output_dir)
 
     all_evaluations: list[dict] = []
+    search_latencies_ms: list[float] = []
+    total_latencies_ms: list[float] = []
+    judge_latencies_ms: list[float] = []
 
     if args.resume:
         for p in sorted(Path(output_dir).glob("*.json")):
@@ -848,6 +891,15 @@ async def async_main() -> None:
                 data = json.loads(p.read_text())
                 if data.get("category") in categories:
                     all_evaluations.append(data)
+                    sl = data.get("retrieval", {}).get("search_latency_ms", 0) or 0
+                    tl = data.get("total_latency_ms", 0) or 0
+                    jl = data.get("judge_latency_ms", 0) or 0
+                    if sl > 0:
+                        search_latencies_ms.append(sl)
+                    if tl > 0:
+                        total_latencies_ms.append(tl)
+                    if jl > 0:
+                        judge_latencies_ms.append(jl)
             except (json.JSONDecodeError, KeyError):
                 continue
         print(f"  Loaded {len(all_evaluations)} existing results")
@@ -935,6 +987,15 @@ async def async_main() -> None:
                 async with results_lock:
                     all_evaluations.append(result)
                     existing_ids.add(qid)
+                    sl = result.get("retrieval", {}).get("search_latency_ms", 0) or 0
+                    tl = result.get("total_latency_ms", 0) or 0
+                    jl = result.get("judge_latency_ms", 0) or 0
+                    if sl > 0:
+                        search_latencies_ms.append(sl)
+                    if tl > 0:
+                        total_latencies_ms.append(tl)
+                    if jl > 0:
+                        judge_latencies_ms.append(jl)
 
     async with mem0:
         with shutdown:
@@ -947,6 +1008,22 @@ async def async_main() -> None:
         if has_cutoffs:
             metrics = compute_locomo_metrics(all_evaluations, cutoffs)
             display_results(metrics, cutoffs)
+
+            # Latency measurements: p50 (median) and p95 (95th percentile) in
+            # seconds for search time (fetching memories) and total time
+            # (search + answer generation; judge excluded per official
+            # "time to generate the complete response" semantics). Judge time
+            # is reported separately for reference only.
+            latency = {
+                "search": compute_latency_summary([v / 1000 for v in search_latencies_ms]),
+                "total": compute_latency_summary([v / 1000 for v in total_latencies_ms]),
+                "judge": compute_latency_summary([v / 1000 for v in judge_latencies_ms]),
+            }
+            s, t, j = latency["search"], latency["total"], latency["judge"]
+            print(f"\nLatency measurements (p50 median / p95 95th percentile, in seconds):")
+            print(f"  Search time: p50={s['p50_s']:.3f}s, p95={s['p95_s']:.3f}s ({s['count']} queries)")
+            print(f"  Total time (search + answer):  p50={t['p50_s']:.3f}s, p95={t['p95_s']:.3f}s ({t['count']} questions)")
+            print(f"  Judge time (reference only):   p50={j['p50_s']:.3f}s, p95={j['p95_s']:.3f}s ({j['count']} questions)")
 
             # Save unified result
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -966,6 +1043,7 @@ async def async_main() -> None:
                     "categories": categories,
                 },
                 "metrics_by_cutoff": metrics,
+                "latency": latency,
                 "evaluations": all_evaluations,
             })
             print(f"\nResults saved to: {unified_path}")

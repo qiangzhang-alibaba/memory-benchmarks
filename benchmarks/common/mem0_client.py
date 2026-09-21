@@ -11,7 +11,15 @@ Async client for Mem0 with two backend modes:
   - **cloud**: Connects to the Mem0 cloud API (api.mem0.ai).
     Uses V3 endpoints with async event polling. Requires API key + org/project IDs.
 
-Both modes expose the same async interface:
+  - **mem0**: Connects to a Mem0 OSS-compatible server using the original
+    REST endpoints (POST /memories, POST /search, DELETE /memories) with
+    API key auth (Authorization: Token). Same wire format as the oss mode.
+
+  - **polarmem**: Connects to a Mem0-compatible v1/v2 REST API
+    (e.g. Polar Mem). Uses POST /v1/memories (sync add) and
+    POST /v2/memories/search. Requires API key (Authorization: Token).
+
+All modes expose the same async interface:
   client.add(messages, user_id, ...)
   client.search(query, user_id, top_k=200, ...)
   client.delete_user(user_id)
@@ -23,6 +31,7 @@ import asyncio
 import logging
 import os
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,14 +41,27 @@ from aiolimiter import AsyncLimiter
 logger = logging.getLogger(__name__)
 
 
+def _format_error(exc: Exception, max_chars: int = 600) -> str:
+    """Format an exception for logging: type, message and a short traceback.
+
+    Some exceptions (e.g. asyncio.TimeoutError) have an empty str(), which
+    made the old logs print a blank reason. Include the type and traceback
+    so failures are always diagnosable.
+    """
+    parts = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+    text = f"type={type(exc).__name__} msg={exc!r} traceback={parts}"
+    return text[:max_chars]
+
+
 class Mem0Client:
     """Async Mem0 client supporting both OSS server and cloud API.
 
     Args:
-        mode: "oss" for self-hosted server, "cloud" for api.mem0.ai.
+        mode: "oss" for self-hosted server, "cloud" for api.mem0.ai,
+              "polarmem" for a Mem0-compatible v1/v2 API (e.g. Polar Mem).
         host: Server URL. Defaults to MEM0_HOST env or http://localhost:8888 (oss)
               / https://api.mem0.ai (cloud).
-        api_key: Cloud API key. Falls back to MEM0_API_KEY env var. (cloud mode only)
+        api_key: API key. Falls back to MEM0_API_KEY env var. (cloud/polarmem only)
         organization_id: Cloud org ID. Falls back to MEM0_ORGANIZATION_ID. (cloud only)
         project_id: Cloud project ID. Falls back to MEM0_PROJECT_ID. (cloud only)
         max_retries: Maximum retry attempts for API calls.
@@ -65,7 +87,6 @@ class Mem0Client:
         event_poll_timeout: float = 300.0,
     ):
         self.mode = mode
-
         if mode == "cloud":
             default_host = "https://api.mem0.ai"
         else:
@@ -86,7 +107,7 @@ class Mem0Client:
     @property
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self.mode == "cloud" and self.api_key:
+        if self.mode in ("cloud", "mem0", "polarmem") and self.api_key:
             headers["Authorization"] = f"Token {self.api_key}"
         return headers
 
@@ -127,8 +148,10 @@ class Mem0Client:
 
         Returns dict with "results" key listing extracted memories, or None on failure.
         """
-        if self.mode == "oss":
+        if self.mode in ("oss", "mem0"):
             return await self._add_oss(messages, user_id, observation_date, timestamp, custom_instructions, metadata)
+        elif self.mode == "polarmem":
+            return await self._add_polarmem(messages, user_id, observation_date, timestamp, custom_instructions, metadata)
         else:
             return await self._add_cloud(messages, user_id, observation_date, timestamp, custom_instructions, metadata)
 
@@ -172,7 +195,7 @@ class Mem0Client:
                 return {"results": []}
 
             except Exception as exc:
-                logger.warning("ADD attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, str(exc)[:200])
+                logger.warning("ADD attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, _format_error(exc))
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.retry_delay * (attempt + 1))
                 else:
@@ -227,7 +250,68 @@ class Mem0Client:
                 return {"results": self._parse_event_results(event_data)}
 
             except Exception as exc:
-                logger.warning("ADD attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, str(exc)[:200])
+                logger.warning("ADD attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, _format_error(exc))
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+                else:
+                    logger.error("ADD failed after %d attempts for user=%s", self.max_retries, user_id)
+                    return None
+
+    async def _add_polarmem(
+        self, messages, user_id, observation_date, timestamp, custom_instructions, metadata,
+    ) -> dict | None:
+        """Add via a Mem0-compatible v1 REST API (Polar Mem) — synchronous endpoint."""
+        session = await self._get_session()
+
+        payload: dict[str, Any] = {"messages": messages, "user_id": user_id}
+        if timestamp is not None:
+            payload["timestamp"] = timestamp
+        elif observation_date is not None:
+            # Convert ISO date to unix epoch
+            try:
+                d = datetime.strptime(observation_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                payload["timestamp"] = int(d.timestamp())
+            except ValueError:
+                pass
+        if custom_instructions:
+            payload["custom_instructions"] = custom_instructions
+        if metadata:
+            payload["metadata"] = metadata
+
+        for attempt in range(self.max_retries):
+            try:
+                async with self.limiter:
+                    async with session.post(f"{self.host}/v1/memories", json=payload) as resp:
+                        if resp.status >= 500:
+                            raise aiohttp.ClientResponseError(
+                                resp.request_info, resp.history, status=resp.status
+                            )
+                        resp.raise_for_status()
+                        data = await resp.json()
+
+                # Normalise: {"results": [{"id", "event", "data": {"memory"}}]}
+                results = data.get("results", []) if isinstance(data, dict) else data
+                if not isinstance(results, list):
+                    results = []
+                normalised = []
+                for item in results:
+                    if not isinstance(item, dict):
+                        continue
+                    if "memory" in item:
+                        normalised.append(item)
+                    elif "data" in item and isinstance(item.get("data"), dict):
+                        entry = {
+                            "id": item.get("id"),
+                            "event": item.get("event"),
+                            "memory": item["data"].get("memory"),
+                        }
+                        if item.get("event") == "UPDATE":
+                            entry["previous_memory"] = item["data"].get("old_memory", item["data"].get("previous_memory", ""))
+                        normalised.append(entry)
+                return {"results": normalised}
+
+            except Exception as exc:
+                logger.warning("ADD attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, _format_error(exc))
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.retry_delay * (attempt + 1))
                 else:
@@ -247,8 +331,10 @@ class Mem0Client:
         score_debug: bool = False,
     ) -> list[dict]:
         """Search memories. Returns list of results sorted by score descending."""
-        if self.mode == "oss":
+        if self.mode in ("oss", "mem0"):
             return await self._search_oss(query, user_id, top_k, rerank)
+        elif self.mode == "polarmem":
+            return await self._search_polarmem(query, user_id, top_k, rerank, score_debug)
         else:
             return await self._search_cloud(query, user_id, top_k, rerank, score_debug)
 
@@ -258,7 +344,10 @@ class Mem0Client:
         payload: dict[str, Any] = {
             "query": query,
             "user_id": user_id,
+            # OSS server reads `limit`; some Mem0-compatible servers read `top_k`.
+            # Sending both keeps either side working (unknown fields are ignored).
             "limit": top_k,
+            "top_k": top_k,
         }
         if rerank:
             payload["rerank"] = True
@@ -305,7 +394,7 @@ class Mem0Client:
                 return normalised
 
             except Exception as exc:
-                logger.warning("SEARCH attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, str(exc)[:200])
+                logger.warning("SEARCH attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, _format_error(exc))
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.retry_delay * (attempt + 1))
                 else:
@@ -336,7 +425,61 @@ class Mem0Client:
                 return results
 
             except Exception as exc:
-                logger.warning("SEARCH attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, str(exc)[:200])
+                logger.warning("SEARCH attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, _format_error(exc))
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+                else:
+                    logger.error("SEARCH failed after %d attempts for user=%s", self.max_retries, user_id)
+                    return []
+
+    async def _search_polarmem(self, query, user_id, top_k, rerank, score_debug) -> list[dict]:
+        """Search via a Mem0-compatible v2 REST API (Polar Mem)."""
+        session = await self._get_session()
+        payload: dict[str, Any] = {
+            "query": query,
+            # Polar Mem requires user_id inside `filters` (official v2 format)
+            "filters": {"user_id": user_id},
+            "top_k": top_k,
+        }
+        if rerank:
+            payload["rerank"] = True
+
+        for attempt in range(self.max_retries):
+            try:
+                async with self.limiter:
+                    async with session.post(f"{self.host}/v2/memories/search", json=payload) as resp:
+                        if resp.status >= 500:
+                            raise aiohttp.ClientResponseError(
+                                resp.request_info, resp.history, status=resp.status
+                            )
+                        resp.raise_for_status()
+                        data = await resp.json()
+
+                # Normalise results (already flat: memory/score/created_at)
+                results = data.get("results", []) if isinstance(data, dict) else data
+                if not isinstance(results, list):
+                    results = []
+
+                normalised = []
+                for r in results:
+                    if not isinstance(r, dict):
+                        continue
+                    entry: dict[str, Any] = {
+                        "memory": r.get("memory", r.get("data", "")),
+                        "score": r.get("score", 0),
+                        "id": r.get("id", ""),
+                    }
+                    if r.get("created_at"):
+                        entry["created_at"] = r["created_at"]
+                    if r.get("updated_at"):
+                        entry["updated_at"] = r["updated_at"]
+                    normalised.append(entry)
+
+                normalised.sort(key=lambda x: x.get("score", 0), reverse=True)
+                return normalised
+
+            except Exception as exc:
+                logger.warning("SEARCH attempt %d/%d failed (user=%s): %s", attempt + 1, self.max_retries, user_id, _format_error(exc))
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.retry_delay * (attempt + 1))
                 else:
@@ -349,8 +492,10 @@ class Mem0Client:
 
     async def delete_user(self, user_id: str) -> bool:
         """Delete all memories for a user. Returns True on success."""
-        if self.mode == "oss":
+        if self.mode in ("oss", "mem0"):
             return await self._delete_user_oss(user_id)
+        elif self.mode == "polarmem":
+            return await self._delete_user_polarmem(user_id)
         else:
             return await self._delete_user_cloud(user_id)
 
@@ -360,6 +505,21 @@ class Mem0Client:
             async with self.limiter:
                 async with session.delete(
                     f"{self.host}/memories",
+                    params={"user_id": user_id},
+                ) as resp:
+                    resp.raise_for_status()
+            logger.info("Deleted memories for user %s", user_id)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to delete user %s: %s", user_id, exc)
+            return False
+
+    async def _delete_user_polarmem(self, user_id: str) -> bool:
+        session = await self._get_session()
+        try:
+            async with self.limiter:
+                async with session.delete(
+                    f"{self.host}/v1/memories",
                     params={"user_id": user_id},
                 ) as resp:
                     resp.raise_for_status()
