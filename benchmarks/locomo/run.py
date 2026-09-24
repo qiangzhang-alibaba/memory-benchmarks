@@ -85,7 +85,15 @@ load_dotenv(override=True)
 DATASET_URL = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
 DEFAULT_DATASET_DIR = "datasets/locomo"
 DEFAULT_DATASET_FILE = "locomo10.json"
-CHUNK_SIZE = 1  # turns per ingestion chunk
+CHUNK_SIZE = 8  # turns per ingestion chunk
+
+# Extraction tuning is fully served-side now (sunk 2026-09-21):
+# - FACT_RETRIEVAL_PROMPT_TWO_SPEAKER is the globally ACTIVE implementation
+#   (two-speaker extraction + attribution + pronoun resolution + per-event
+#   granularity + detail preservation), so no per-request ``prompts`` needed.
+# - The default disk prompt gained the generic pronoun-resolution and
+#   event-granularity rules for single-speaker scenarios.
+# No custom_instructions / prompts are sent: add() uses the server defaults.
 
 
 # ===============================================================================
@@ -402,6 +410,7 @@ async def process_question(
     predict_only: bool,
     logger: Any,
     score_debug: bool = False,
+    rerank: bool = False,
 ) -> dict[str, Any]:
     """Process a single question: search + answer + judge at multiple cutoffs.
 
@@ -416,7 +425,7 @@ async def process_question(
 
     # --- Search ---
     start = time.monotonic()
-    search_results = await mem0.search(question, user_id, top_k=top_k, score_debug=score_debug)
+    search_results = await mem0.search(question, user_id, top_k=top_k, rerank=rerank, score_debug=score_debug)
     search_latency = (time.monotonic() - start) * 1000
 
     formatted, query_debug = format_search_results(search_results)
@@ -466,7 +475,10 @@ async def process_question(
         label = cutoff_label(c)
 
         # Generate answer
-        gen_prompt = get_answer_generation_prompt(question, sliced, reference_date=reference_date_human, user_profile=user_profile)
+        gen_prompt = get_answer_generation_prompt(
+            question, sliced, reference_date=reference_date_human, user_profile=user_profile,
+            # allow_reasoning=(c >= 200),
+        )
         generated_answer = await answerer.generate(system="", user=gen_prompt)
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
@@ -543,6 +555,7 @@ async def apply_locomo_judge_to_saved_result(
 
         gen_prompt = get_answer_generation_prompt(
             question, sliced, reference_date=reference_date_human, user_profile=user_profile,
+            # allow_reasoning=(c >= 200),
         )
         generated_answer = await answerer.generate(system="", user=gen_prompt)
         if "ANSWER:" in generated_answer:
@@ -715,6 +728,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     parser.add_argument("--debug", action="store_true", help="Verbose logging")
     parser.add_argument("--score-debug", action="store_true", help="Include score breakdowns in output")
+    parser.add_argument("--rerank", action="store_true", help="Enable reranking for search results")
     parser.add_argument("--dataset-path", default=None, help="Path to local locomo10.json")
     parser.add_argument("--run-id", default=None, help="Reuse a specific run_id for resume")
     parser.add_argument("--categories", default="1,2,3,4", help="Comma-separated categories")
@@ -979,6 +993,7 @@ async def async_main() -> None:
                     predict_only=args.predict_only,
                     logger=logger,
                     score_debug=args.score_debug,
+                    rerank=args.rerank,
                 )
 
                 # Save per-question result

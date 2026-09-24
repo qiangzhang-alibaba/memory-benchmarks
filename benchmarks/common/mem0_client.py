@@ -82,7 +82,7 @@ class Mem0Client:
         max_retries: int = 5,
         retry_delay: float = 5.0,
         rpm: int = 60,
-        timeout: float = 300.0,
+        timeout: float = 1800.0,
         event_poll_interval: float = 0.5,
         event_poll_timeout: float = 300.0,
     ):
@@ -143,6 +143,7 @@ class Mem0Client:
         timestamp: int | None = None,
         custom_instructions: str | None = None,
         metadata: dict | None = None,
+        prompts: list[dict] | None = None,
     ) -> dict | None:
         """Add memories from a conversation.
 
@@ -151,7 +152,7 @@ class Mem0Client:
         if self.mode in ("oss", "mem0"):
             return await self._add_oss(messages, user_id, observation_date, timestamp, custom_instructions, metadata)
         elif self.mode == "polarmem":
-            return await self._add_polarmem(messages, user_id, observation_date, timestamp, custom_instructions, metadata)
+            return await self._add_polarmem(messages, user_id, observation_date, timestamp, custom_instructions, metadata, prompts)
         else:
             return await self._add_cloud(messages, user_id, observation_date, timestamp, custom_instructions, metadata)
 
@@ -258,12 +259,14 @@ class Mem0Client:
                     return None
 
     async def _add_polarmem(
-        self, messages, user_id, observation_date, timestamp, custom_instructions, metadata,
+        self, messages, user_id, observation_date, timestamp, custom_instructions, metadata, prompts=None,
     ) -> dict | None:
         """Add via a Mem0-compatible v1 REST API (Polar Mem) — synchronous endpoint."""
         session = await self._get_session()
 
         payload: dict[str, Any] = {"messages": messages, "user_id": user_id}
+        if prompts:
+            payload["prompts"] = prompts
         if timestamp is not None:
             payload["timestamp"] = timestamp
         elif observation_date is not None:
@@ -460,22 +463,29 @@ class Mem0Client:
                 if not isinstance(results, list):
                     results = []
 
+                # POLAR_CODE: rerank 结果必须保留 rerank_score 并以其排序。
+                # 旧实现丢弃 rerank_score 且用 vector 分重排，rerank 白做。
                 normalised = []
                 for r in results:
                     if not isinstance(r, dict):
                         continue
                     entry: dict[str, Any] = {
                         "memory": r.get("memory", r.get("data", "")),
-                        "score": r.get("score", 0),
+                        "score": r.get("rerank_score", r.get("score", 0)),
                         "id": r.get("id", ""),
                     }
+                    if "rerank_score" in r:
+                        entry["rerank_score"] = r["rerank_score"]
                     if r.get("created_at"):
                         entry["created_at"] = r["created_at"]
                     if r.get("updated_at"):
                         entry["updated_at"] = r["updated_at"]
                     normalised.append(entry)
 
-                normalised.sort(key=lambda x: x.get("score", 0), reverse=True)
+                normalised.sort(
+                    key=lambda x: x.get("rerank_score", x.get("score", 0)),
+                    reverse=True,
+                )
                 return normalised
 
             except Exception as exc:
@@ -619,14 +629,23 @@ def format_search_results(search_results: list[dict]) -> tuple[list[dict], dict 
         query_debug = search_results.get("query_debug")
         search_results = search_results.get("results", [])
 
-    sorted_results = sorted(search_results, key=lambda x: x.get("score", 0), reverse=True)
+    # POLAR_CODE: rerank 后的记忆带 rerank_score（相关性更精确）。
+    # 排序与 score 输出必须优先取 rerank_score，否则会打乱 server 端
+    # rerank 已排好的顺序（旧实现用 vector 分重排，rerank 白做）。
+    sorted_results = sorted(
+        search_results,
+        key=lambda x: x.get("rerank_score", x.get("score", 0)),
+        reverse=True,
+    )
     formatted = []
     for r in sorted_results:
         entry: dict[str, Any] = {
             "memory": r.get("memory", ""),
-            "score": r.get("score", 0),
+            "score": r.get("rerank_score", r.get("score", 0)),
             "id": r.get("id", ""),
         }
+        if "rerank_score" in r:
+            entry["rerank_score"] = r["rerank_score"]
         if r.get("created_at"):
             entry["created_at"] = r["created_at"]
         if r.get("updated_at"):
