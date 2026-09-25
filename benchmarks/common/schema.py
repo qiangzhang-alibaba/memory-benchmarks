@@ -61,6 +61,16 @@ class CutoffResult(BaseModel):
     reason: str = ""
     nugget_scores: list[NuggetScore] | None = None
     error: str | None = None
+    # Per-cutoff latency (milliseconds). ``search_latency_ms`` is measured by an
+    # independent search at this cutoff's own top_k; ``latency_ms`` is the full
+    # response time (search + answer generation, judge excluded). Both are None
+    # when produced by evaluate-only runs, where no Mem0 search is executed and
+    # the primary top_k latency must NOT be reused across cutoffs; in that case
+    # ``search_latency_source`` records why (e.g. "not_measured_evaluate_only").
+    search_latency_ms: float | None = None
+    generation_latency_ms: float | None = None
+    latency_ms: float | None = None
+    search_latency_source: str | None = None
 
 
 class EvalItem(BaseModel):

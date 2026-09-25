@@ -181,6 +181,81 @@ def compute_latency_summary(latency_seconds: list[float]) -> dict[str, Any]:
     }
 
 
+def compute_latency_by_cutoff(
+    evaluations: list[dict[str, Any]],
+    cutoff_labels: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Compute latency summaries separately for each top-k cutoff.
+
+    For every cutoff label (e.g. "top_10", "top_20", "top_50", "top_200") this
+    aggregates the per-question latencies recorded in ``cutoff_results[label]``:
+
+    - ``search``: retrieval latency measured by an independent search executed
+      at that cutoff's own top_k (the primary metric of interest). Entries
+      recorded as ``None`` (e.g. evaluate-only runs, where no Mem0 search
+      happens and the latency is explicitly not measured rather than reused
+      from the primary top_k search) are skipped, so a cutoff may report
+      ``count == 0``.
+    - ``generation``: answer-generation latency at that cutoff.
+    - ``total``: search + generation (judge excluded); skipped when the
+      per-cutoff search latency was not measured.
+
+    Args:
+        evaluations: List of evaluation result dicts.
+        cutoff_labels: Cutoff label strings to report, in display order.
+
+    Returns:
+        Dict mapping cutoff label -> {"search", "generation", "total"} summaries.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for label in cutoff_labels:
+        total_ms: list[float] = []
+        gen_ms: list[float] = []
+        search_ms: list[float] = []
+        for e in evaluations:
+            cr = e.get("cutoff_results", {}).get(label, {})
+            if not isinstance(cr, dict):
+                continue
+            tl = cr.get("latency_ms", 0) or 0
+            gl = cr.get("generation_latency_ms", 0) or 0
+            sl = cr.get("search_latency_ms", 0) or 0
+            if tl > 0:
+                total_ms.append(tl)
+            if gl > 0:
+                gen_ms.append(gl)
+            if sl > 0:
+                search_ms.append(sl)
+        result[label] = {
+            "search": compute_latency_summary([v / 1000 for v in search_ms]),
+            "generation": compute_latency_summary([v / 1000 for v in gen_ms]),
+            "total": compute_latency_summary([v / 1000 for v in total_ms]),
+        }
+    return result
+
+
+def print_latency_by_cutoff(
+    latency_by_cutoff: dict[str, dict[str, Any]],
+    cutoff_labels: list[str],
+) -> None:
+    """Print per-cutoff SEARCH latency summaries (seconds) to stdout."""
+    print(
+        "\nSearch latency by cutoff (seconds; each cutoff searched independently at its own top_k):"
+    )
+    for label in cutoff_labels:
+        entry = latency_by_cutoff.get(label)
+        if not entry:
+            continue
+        s = entry["search"]
+        if s["count"] == 0:
+            print(f"  {label}: no search latency samples recorded")
+            continue
+        print(
+            f"  {label}: search p50={s['p50_s']:.3f}s p95={s['p95_s']:.3f}s "
+            f"avg={s['avg_s']:.3f}s min={s['min_s']:.3f}s max={s['max_s']:.3f}s "
+            f"({s['count']} queries)"
+        )
+
+
 def compute_kendall_tau_b(predicted_order: list[int], reference_order: list[int]) -> float:
     """Compute Kendall tau-b rank correlation coefficient.
 
