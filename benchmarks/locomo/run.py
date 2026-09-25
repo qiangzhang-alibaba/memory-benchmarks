@@ -44,7 +44,12 @@ from tqdm import tqdm
 
 from benchmarks.common.llm_client import LLMClient
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
-from benchmarks.common.metrics import compute_latency_summary, compute_overall_metrics
+from benchmarks.common.metrics import (
+    compute_latency_by_cutoff,
+    compute_latency_summary,
+    compute_overall_metrics,
+    print_latency_by_cutoff,
+)
 from benchmarks.common.schema import (
     CutoffResult,
     EvalItem,
@@ -471,15 +476,24 @@ async def process_question(
 
     judge_time_ms = 0.0
     for c in cutoffs:
-        sliced = formatted[:c]
         label = cutoff_label(c)
+
+        # Independent search at this cutoff's own top_k, timed separately so each
+        # cutoff reports its true retrieval latency (a top_10 search can be faster
+        # than top_200, e.g. less reranking / less data transferred).
+        c_search_start = time.monotonic()
+        c_results = await mem0.search(question, user_id, top_k=c, rerank=rerank, score_debug=score_debug)
+        c_search_latency = (time.monotonic() - c_search_start) * 1000
+        sliced, _ = format_search_results(c_results)
 
         # Generate answer
         gen_prompt = get_answer_generation_prompt(
             question, sliced, reference_date=reference_date_human, user_profile=user_profile,
             # allow_reasoning=(c >= 200),
         )
+        gen_start = time.monotonic()
         generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generation_latency = (time.monotonic() - gen_start) * 1000
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
@@ -510,6 +524,9 @@ async def process_question(
             "generated_answer": generated_answer,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
+            "search_latency_ms": round(c_search_latency, 1),
+            "generation_latency_ms": round(generation_latency, 1),
+            "latency_ms": round(c_search_latency + generation_latency, 1),
         }
 
     result["cutoff_results"] = cutoff_results
@@ -537,6 +554,9 @@ async def apply_locomo_judge_to_saved_result(
     answer = str(qa["answer"])
     reference_date_human = result.get("reference_date")
     user_profile = result.get("user_profile")
+    # Evaluate-only mode has no Mem0 connection; reuse the primary search latency
+    # saved during the full run (shared across cutoffs in this path).
+    search_latency = result.get("retrieval", {}).get("search_latency_ms", 0) or 0
 
     cutoff_results: dict[str, dict] = {}
     processed_answer = preprocess_answer(category, answer)
@@ -557,7 +577,9 @@ async def apply_locomo_judge_to_saved_result(
             question, sliced, reference_date=reference_date_human, user_profile=user_profile,
             # allow_reasoning=(c >= 200),
         )
+        gen_start = time.monotonic()
         generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generation_latency = (time.monotonic() - gen_start) * 1000
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
@@ -587,6 +609,9 @@ async def apply_locomo_judge_to_saved_result(
             "generated_answer": generated_answer,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
+            "search_latency_ms": round(search_latency, 1),
+            "generation_latency_ms": round(generation_latency, 1),
+            "latency_ms": round(search_latency + generation_latency, 1),
         }
 
     result["cutoff_results"] = cutoff_results
@@ -855,6 +880,10 @@ async def async_main() -> None:
         metrics = compute_locomo_metrics(all_evaluations, cutoffs)
         display_results(metrics, cutoffs)
 
+        cutoff_labels = [cutoff_label(c) for c in cutoffs]
+        latency_by_cutoff = compute_latency_by_cutoff(all_evaluations, cutoff_labels)
+        print_latency_by_cutoff(latency_by_cutoff, cutoff_labels)
+
         run_id_meta = args.run_id or run_id
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -875,6 +904,7 @@ async def async_main() -> None:
                 "evaluate_only": True,
             },
             "metrics_by_cutoff": metrics,
+            "latency_by_cutoff": latency_by_cutoff,
             "evaluations": all_evaluations,
         })
         print(f"\nResults saved to: {unified_path}")
@@ -1040,6 +1070,13 @@ async def async_main() -> None:
             print(f"  Total time (search + answer):  p50={t['p50_s']:.3f}s, p95={t['p95_s']:.3f}s ({t['count']} questions)")
             print(f"  Judge time (reference only):   p50={j['p50_s']:.3f}s, p95={j['p95_s']:.3f}s ({j['count']} questions)")
 
+            # Per-cutoff SEARCH latency (top_10/top_20/top_50/top_200): each cutoff
+            # is retrieved by an independent search at its own top_k, so these
+            # reflect the true retrieval cost per cutoff.
+            cutoff_labels = [cutoff_label(c) for c in cutoffs]
+            latency_by_cutoff = compute_latency_by_cutoff(all_evaluations, cutoff_labels)
+            print_latency_by_cutoff(latency_by_cutoff, cutoff_labels)
+
             # Save unified result
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             unified_path = os.path.join(args.output_dir, f"locomo_results_{timestamp}.json")
@@ -1059,6 +1096,7 @@ async def async_main() -> None:
                 },
                 "metrics_by_cutoff": metrics,
                 "latency": latency,
+                "latency_by_cutoff": latency_by_cutoff,
                 "evaluations": all_evaluations,
             })
             print(f"\nResults saved to: {unified_path}")
