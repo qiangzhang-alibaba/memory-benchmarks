@@ -59,6 +59,10 @@ class CutoffResult(BaseModel):
     generated_answer: str = ""
     memories_evaluated: int = 0
     reason: str = ""
+    # Token-level F1 (Porter-stemmed, official LoCoMo methodology) between the
+    # generated answer and the ground truth. None for legacy results produced
+    # before F1 tracking was added.
+    f1: float | None = None
     nugget_scores: list[NuggetScore] | None = None
     error: str | None = None
     # Per-cutoff latency (milliseconds). ``search_latency_ms`` is measured by an
@@ -96,6 +100,9 @@ class GroupMetrics(BaseModel):
     correct: int = 0
     accuracy: float = 0.0
     avg_score: float = 0.0
+    # Mean token-level F1 (0-100). LOCOMO only; None for benchmarks that do
+    # not compute token F1.
+    avg_f1: float | None = None
 
 
 class CutoffMetrics(BaseModel):

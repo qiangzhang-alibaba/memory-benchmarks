@@ -48,6 +48,7 @@ from benchmarks.common.metrics import (
     compute_latency_by_cutoff,
     compute_latency_summary,
     compute_overall_metrics,
+    locomo_f1,
     print_latency_by_cutoff,
 )
 from benchmarks.common.schema import (
@@ -507,10 +508,14 @@ async def process_question(
 
         score = 1.0 if correct else 0.0
         judgment = "CORRECT" if correct else "WRONG"
+        # Token-level F1 vs ground truth (same preprocessed answer the judge
+        # sees, i.e. category-3 keeps only the part before ";").
+        f1 = locomo_f1(generated_answer, processed_answer, category)
 
         cutoff_results[label] = {
             "judgment": judgment,
             "score": score,
+            "f1": round(f1, 4),
             "generated_answer": generated_answer,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
@@ -598,10 +603,12 @@ async def apply_locomo_judge_to_saved_result(
 
         score = 1.0 if correct else 0.0
         judgment = "CORRECT" if correct else "WRONG"
+        f1 = locomo_f1(generated_answer, processed_answer, category)
 
         cutoff_results[label] = {
             "judgment": judgment,
             "score": score,
+            "f1": round(f1, 4),
             "generated_answer": generated_answer,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
@@ -665,6 +672,25 @@ def locomo_predict_outputs_complete(
 # ===============================================================================
 
 
+def _cutoff_f1(e: dict, label: str) -> float | None:
+    """Token F1 for one evaluation at a cutoff.
+
+    Prefers the value stored at generation time; falls back to recomputing
+    from generated_answer vs ground truth so legacy per-question files (saved
+    before F1 tracking) still aggregate correctly.
+    """
+    cr = e.get("cutoff_results", {}).get(label, {})
+    if not isinstance(cr, dict):
+        return None
+    if cr.get("f1") is not None:
+        return float(cr["f1"])
+    gen = cr.get("generated_answer")
+    if gen is None:
+        return None
+    gt = preprocess_answer(e.get("category", 0), str(e.get("ground_truth_answer", "")))
+    return locomo_f1(gen, gt, e.get("category", 0))
+
+
 def compute_locomo_metrics(evaluations: list[dict], cutoffs: list[int]) -> dict:
     """Compute per-category and overall metrics at each cutoff."""
     metrics_by_cutoff = {}
@@ -673,21 +699,29 @@ def compute_locomo_metrics(evaluations: list[dict], cutoffs: list[int]) -> dict:
         total = len(evaluations)
         scores = [e.get("cutoff_results", {}).get(label, {}).get("score", 0.0) for e in evaluations]
         correct = sum(1 for s in scores if s >= 0.5)
+        f1_values = [v for v in (_cutoff_f1(e, label) for e in evaluations) if v is not None]
 
         by_category: dict[str, list] = defaultdict(list)
+        by_category_f1: dict[str, list] = defaultdict(list)
         for e in evaluations:
             cat_name = e.get("category_name", "unknown")
             by_category[cat_name].append(e.get("cutoff_results", {}).get(label, {}).get("score", 0.0))
+            f1v = _cutoff_f1(e, label)
+            if f1v is not None:
+                by_category_f1[cat_name].append(f1v)
 
         cat_metrics = {}
         for cat_name in sorted(by_category):
             cat_scores = by_category[cat_name]
             cat_correct = sum(1 for s in cat_scores if s >= 0.5)
+            cat_f1 = by_category_f1.get(cat_name, [])
             cat_metrics[cat_name] = {
                 "total": len(cat_scores),
                 "correct": cat_correct,
                 "accuracy": cat_correct / len(cat_scores) * 100 if cat_scores else 0.0,
                 "avg_score": statistics.mean(cat_scores) * 100 if cat_scores else 0.0,
+                "avg_f1": statistics.mean(cat_f1) * 100 if cat_f1 else None,
+                "f1_count": len(cat_f1),
             }
 
         metrics_by_cutoff[label] = {
@@ -696,6 +730,8 @@ def compute_locomo_metrics(evaluations: list[dict], cutoffs: list[int]) -> dict:
                 "correct": correct,
                 "accuracy": correct / total * 100 if total else 0.0,
                 "avg_score": statistics.mean(scores) * 100 if scores else 0.0,
+                "avg_f1": statistics.mean(f1_values) * 100 if f1_values else None,
+                "f1_count": len(f1_values),
             },
             "by_category": cat_metrics,
         }
@@ -708,11 +744,16 @@ def display_results(metrics_by_cutoff: dict, cutoffs: list[int]) -> None:
         label = cutoff_label(c)
         m = metrics_by_cutoff.get(label, {})
         overall = m.get("overall", {})
+        f1_part = (
+            f" f1={overall['avg_f1']:.1f}%"
+            if overall.get("avg_f1") is not None else ""
+        )
         print(f"\n--- {label} ---")
         print(f"  Overall: {overall.get('correct', 0)}/{overall.get('total', 0)} "
-              f"({overall.get('accuracy', 0):.1f}%) avg={overall.get('avg_score', 0):.1f}%")
+              f"({overall.get('accuracy', 0):.1f}%) avg={overall.get('avg_score', 0):.1f}%{f1_part}")
         for cat_name, cm in sorted(m.get("by_category", {}).items()):
-            print(f"  {cat_name}: {cm['correct']}/{cm['total']} ({cm['accuracy']:.1f}%)")
+            cat_f1_part = f" f1={cm['avg_f1']:.1f}%" if cm.get("avg_f1") is not None else ""
+            print(f"  {cat_name}: {cm['correct']}/{cm['total']} ({cm['accuracy']:.1f}%){cat_f1_part}")
 
 
 # ===============================================================================

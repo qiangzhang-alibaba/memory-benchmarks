@@ -11,11 +11,225 @@ Shared metrics helpers for all benchmarks:
 
 from __future__ import annotations
 
+import re
 import statistics
-from collections import defaultdict
+import string
+from collections import Counter, defaultdict
 from typing import Any
 
 from .schema import CutoffMetrics, GroupMetrics, Metrics
+
+
+# ===============================================================================
+# TOKEN-LEVEL F1 (LoCoMo official methodology, stdlib-only reimplementation)
+# ===============================================================================
+# Mirrors datasets/locomo/repo/task_eval/evaluation.py (normalize_answer +
+# Porter-stemmed token F1) without its heavy dependencies (nltk / regex /
+# numpy), so the benchmark pipeline stays installable from requirements.txt.
+
+
+def _normalize_answer(s: str) -> str:
+    """Lowercase, drop commas/punctuation/articles and collapse whitespace.
+
+    Same normalization as the official LoCoMo ``normalize_answer`` (which also
+    strips "and" as an article-like token).
+    """
+    s = s.replace(",", "")
+    s = re.sub(r"\b(a|an|the|and)\b", " ", s.lower())
+    exclude = set(string.punctuation)
+    s = "".join(ch for ch in s if ch not in exclude)
+    return " ".join(s.split())
+
+
+def _cv_pattern(w: str) -> str:
+    """Consonant/vowel pattern string, with Porter's special 'y' handling.
+
+    'y' is a consonant at word start or after a vowel, and a vowel after a
+    consonant (so "cycling" -> C V C C V C G..., letting -ing strip to "cycl").
+    """
+    out = []
+    for i, ch in enumerate(w):
+        if ch in "aeiou":
+            out.append("V")
+        elif ch == "y":
+            prev_vowel = i > 0 and w[i - 1] in "aeiou"
+            out.append("C" if (i == 0 or prev_vowel) else "V")
+        else:
+            out.append("C")
+    return "".join(out)
+
+
+def _measure(stem: str) -> int:
+    """Porter stemmer m(): number of VC sequences in [C](VC)^m[V]."""
+    cv = _cv_pattern(stem)
+    cv = re.sub(r"C+", "C", cv)
+    cv = re.sub(r"V+", "V", cv)
+    return cv.count("VC")
+
+
+def _has_vowel(stem: str) -> bool:
+    return "V" in _cv_pattern(stem)
+
+
+def _ends_double_consonant(stem: str) -> bool:
+    return len(stem) >= 2 and stem[-1] == stem[-2] and stem[-1] not in "aeiou"
+
+
+def porter_stem(word: str) -> str:
+    """Compact pure-Python Porter stemmer (algorithm from Porter 1980).
+
+    Produces stems equivalent to nltk.stem.PorterStemmer used by the official
+    LoCoMo evaluation for common English words.
+    """
+    w = word.lower()
+    if len(w) <= 2:
+        return w
+
+    # Step 1a
+    if w.endswith("sses"):
+        w = w[:-2]
+    elif w.endswith("ies"):
+        w = w[:-2]
+    elif not w.endswith("ss") and w.endswith("s"):
+        w = w[:-1]
+
+    # Step 1b
+    step1b_extra = False
+    if w.endswith("eed"):
+        stem = w[:-3]
+        if _measure(stem) > 0:
+            w = w[:-1]
+    elif w.endswith("ed"):
+        stem = w[:-2]
+        if _has_vowel(stem):
+            w = stem
+            step1b_extra = True
+    elif w.endswith("ing"):
+        stem = w[:-3]
+        if _has_vowel(stem):
+            w = stem
+            step1b_extra = True
+
+    if step1b_extra:
+        if w.endswith("at") or w.endswith("bl") or w.endswith("iz"):
+            w += "e"
+        elif _ends_double_consonant(w) and w[-1] not in "lsz":
+            w = w[:-1]
+        elif _measure(w) == 1 and _ends_cvc_simple(w):
+            w += "e"
+
+    # Step 1c
+    if w.endswith("y") and _has_vowel(w[:-1]):
+        w = w[:-1] + "i"
+
+    # Step 2
+    step2 = {
+        "ational": "ate", "tional": "tion", "enci": "ence", "anci": "ance",
+        "izer": "ize", "abli": "able", "alli": "al", "entli": "ent",
+        "eli": "e", "ousli": "ous", "ization": "ize", "ation": "ate",
+        "ator": "ate", "alism": "al", "iveness": "ive", "fulness": "ful",
+        "ousness": "ous", "aliti": "al", "iviti": "ive", "biliti": "ble",
+    }
+    for suffix, repl in step2.items():
+        if w.endswith(suffix):
+            stem = w[: -len(suffix)]
+            if _measure(stem) > 0:
+                w = stem + repl
+            break
+
+    # Step 3
+    step3 = {
+        "icate": "ic", "ative": "", "alize": "al",
+        "iciti": "ic", "ical": "ic", "ful": "", "ness": "",
+    }
+    for suffix, repl in step3.items():
+        if w.endswith(suffix):
+            stem = w[: -len(suffix)]
+            if _measure(stem) > 0:
+                w = stem + repl
+            break
+
+    # Step 4: (m>1 on the STEM) SUFFIX -> "", except -ion where the stem must
+    # end in s/t. Classic Porter measures m on the remaining stem, not the
+    # full word (so "disable"->"dis" has m=1 and is NOT stripped to "dis").
+    step4_suffixes = (
+        "al", "ance", "ence", "er", "ic", "able", "ible", "ant",
+        "ement", "ment", "ent", "ion", "ou", "ism", "ate", "iti",
+        "ous", "ive", "ize",
+    )
+    for suffix in step4_suffixes:
+        if w.endswith(suffix):
+            stem = w[: -len(suffix)]
+            if _measure(stem) > 1:
+                if suffix == "ion":
+                    if stem and stem[-1] in "st":
+                        w = stem
+                else:
+                    w = stem
+            break
+
+    # Step 5a
+    if w.endswith("e"):
+        stem = w[:-1]
+        if _measure(stem) > 1 or (_measure(stem) == 1 and not _ends_cvc_simple(stem)):
+            w = stem
+    # Step 5b
+    if _measure(w) > 1 and _ends_double_consonant(w) and w[-1] == "l":
+        w = w[:-1]
+
+    return w
+
+
+def _ends_cvc_simple(w: str) -> bool:
+    """*o condition: ends C-V-C where the final consonant is not w, x or y.
+
+    Vowels are aeiou; y counts as a consonant everywhere except when it is the
+    final letter, which is excluded via the w/x/y check (classic Porter *o).
+    """
+    if len(w) < 3:
+        return False
+    c1, v, c2 = w[-3], w[-2], w[-1]
+    if c2 in "aeiouwxy" or v not in "aeiou" or c1 in "aeiou":
+        return False
+    return True
+
+
+def token_f1(prediction: str, ground_truth: str) -> float:
+    """Porter-stemmed token-level F1 between one prediction and one answer.
+
+    Same computation as official LoCoMo ``f1_score``: normalize both sides,
+    stem tokens, precision/recall over the multiset intersection.
+    """
+    pred_tokens = [porter_stem(t) for t in _normalize_answer(prediction).split()]
+    gt_tokens = [porter_stem(t) for t in _normalize_answer(ground_truth).split()]
+    if not pred_tokens or not gt_tokens:
+        return 0.0
+    common = Counter(pred_tokens) & Counter(gt_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(gt_tokens)
+    return (2 * precision * recall) / (precision + recall)
+
+
+def locomo_f1(prediction: str, ground_truth: str, category: int) -> float:
+    """Token F1 following the official LoCoMo per-category convention.
+
+    - category 1 (multi-hop): comma-split both sides into sub-answers and take
+      the mean over ground-truth parts of the best prediction match (official
+      ``f1``), giving partial credit for multi-part answers.
+    - categories 2/3/4: plain stemmed token F1 (official ``f1_score``).
+    """
+    if category == 1:
+        preds = [p.strip() for p in prediction.split(",") if p.strip()]
+        gts = [g.strip() for g in ground_truth.split(",") if g.strip()]
+        if not preds or not gts:
+            return token_f1(prediction, ground_truth)
+        return statistics.mean(
+            max(token_f1(p, gt) for p in preds) for gt in gts
+        )
+    return token_f1(prediction, ground_truth)
 
 
 def compute_group_metrics(
